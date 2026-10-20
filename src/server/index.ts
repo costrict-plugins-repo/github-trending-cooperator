@@ -1,0 +1,119 @@
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { deriveScope } from "../session/scope.ts";
+import { generateSummary } from "../session/summary.ts";
+import { registerSquadMember, updateSquadStatus, heartbeat, findScopesWithPrefix } from "../db/squad.ts";
+import { pickScope } from "../session/claim-scope.ts";
+import { getClient } from "../db/client.ts";
+import { HEARTBEAT_INTERVAL_MS } from "../config.ts";
+import { listSquadTool } from "./tools/list_squad.ts";
+import { sendMessageTool } from "./tools/send_message.ts";
+import { setSummaryTool } from "./tools/set_summary.ts";
+import { myScopeTool } from "./tools/my_scope.ts";
+import type { Message } from "../types.ts";
+
+const tools = [myScopeTool, listSquadTool, sendMessageTool, setSummaryTool];
+
+async function main(): Promise<void> {
+  const baseScope = deriveScope();
+  const existing = await findScopesWithPrefix(baseScope.full);
+  const scopeId = pickScope(baseScope.full, existing);
+  const scope = { ...baseScope, full: scopeId };
+  const summary = generateSummary(scope.repo);
+
+  await registerSquadMember(scope.full, summary);
+
+  const heartbeatInterval = setInterval(() => heartbeat(scope.full), HEARTBEAT_INTERVAL_MS);
+
+  async function shutdown(): Promise<void> {
+    clearInterval(heartbeatInterval);
+    await updateSquadStatus(scope.full, "offline");
+    process.exit(0);
+  }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  const server = new Server(
+    { name: "claude-coop", version: "0.1.1" },
+    {
+      capabilities: {
+        tools: {},
+        experimental: { "claude/channel": {} },
+      },
+      instructions: `You are connected to claude-coop. Other Claude Code sessions can see your status and message you in real time.
+
+## Summary
+Call set_summary at the start of every session and whenever your task focus changes. Write summaries understandable to someone who knows nothing about the project — plain language, not jargon or branch names. Good: "Building a login page with Google OAuth for a SaaS app". Bad: "myapp: OAuth flow". Keep it under 15 words.
+
+## Collaboration
+- Before starting work, call list_squad to see who else is online. If another session is working in the same repo, coordinate to avoid conflicts — especially on shared files.
+- Use threads to organize conversations by topic (e.g. "auth-refactor", "bug-investigation"). Always reply on the same thread rather than starting new ones.
+- Keep messages concise and actionable. State what you need or what you found — don't send greetings or filler.
+- If you're about to edit a file another session mentioned in their summary, message them first to avoid merge conflicts.`,
+    }
+  );
+
+  // Subscribe to inbound messages via Supabase Realtime and push into Claude via channel
+  getClient()
+    .channel(`inbox:${scope.full}`)
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "messages", filter: `to_scope=eq.${scope.full}` },
+      async (payload) => {
+        const msg = payload.new as Message;
+        const threadPrefix = msg.thread ? `[thread: ${msg.thread}] ` : "";
+        await server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: `${threadPrefix}Message from ${msg.from_scope}:\n${msg.body}`,
+            meta: { from_scope: msg.from_scope, message_id: msg.id, thread: msg.thread ?? undefined },
+          },
+        });
+      }
+    )
+    .subscribe();
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    })),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const tool = tools.find((t) => t.name === req.params.name);
+    if (!tool) throw new Error(`Unknown tool: ${req.params.name}`);
+
+    const args = req.params.arguments ?? {};
+    let result: string;
+
+    switch (tool.name) {
+      case "my_scope":
+        result = myScopeTool.handler(scope.full);
+        break;
+      case "list_squad":
+        result = await listSquadTool.handler(scope.full);
+        break;
+      case "send_message":
+        result = await sendMessageTool.handler(args as { to?: string | string[]; body: string; thread?: string; add?: string[] }, scope.full);
+        break;
+      case "set_summary":
+        result = await setSummaryTool.handler(args as { summary: string }, scope.full);
+        break;
+      default:
+        throw new Error(`Unhandled tool: ${tool.name}`);
+    }
+
+    return { content: [{ type: "text", text: result }] };
+  });
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
